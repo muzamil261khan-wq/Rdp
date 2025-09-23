@@ -1,0 +1,121 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Restore Old Data if Exists
+        uses: actions/download-artifact@v4
+        with:
+          name: rdp-data
+          path: C:\RDPData
+        continue-on-error: true
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = 'kamran@786'
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection + Periodic Backup
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: 1234"
+          Write-Host "==================`n"
+
+          # Ensure backup folder exists
+          New-Item -ItemType Directory -Force -Path C:\RDPData | Out-Null
+
+          $iteration = 0
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Iteration $iteration"
+
+              # Create backup zip
+              $zipPath = "$env:TEMP\RDPData.zip"
+              if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+              Compress-Archive -Path C:\RDPData\* -DestinationPath $zipPath -Force -ErrorAction SilentlyContinue
+
+              # Upload artifact each cycle
+              Write-Host "Uploading RDPData snapshot..."
+              echo "##[group]Upload iteration $iteration"
+              echo "##[endgroup]"
+
+              # Use upload-artifact action
+              & curl -s -X POST -H "Authorization: Bearer $env:ACTIONS_RUNTIME_TOKEN" `
+                -H "Content-Type: application/zip" `
+                --data-binary "@$zipPath" `
+                "$env:ACTIONS_RUNTIME_URL/_apis/pipelines/workflows/$env:GITHUB_RUN_ID/artifacts?artifactName=rdp-data&api-version=6.0-preview"
+
+              $iteration++
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Save Final Data on Exit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-data
+          path: C:\RDPData
